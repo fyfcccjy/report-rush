@@ -1,0 +1,33 @@
+# 依赖
+node_modules/
+package-lock.json
+yarn.lock
+
+# 构建产物
+dist/
+build/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.log
+*.tmp
+_internal/
+*.bak
+
+# 团队协作缓存
+.hbuilderx/
+.vendor-cache/
+.superpowers/
+
+# Python
+__pycache__/
+*.pyc

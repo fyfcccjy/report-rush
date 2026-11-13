@@ -1,0 +1,1241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>赶报告</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #0f1220;
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    font-family: "Microsoft YaHei", sans-serif;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    box-shadow: 0 8px 40px rgba(0,0,0,.6);
+    border-radius: 4px;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+/*
+ * 赶报告 —— 一个像素风横版闯关小游戏
+ * 单文件 HTML5 Canvas 实现，无任何外部依赖。
+ *
+ * 结构：
+ *   1. 常量与工具
+ *   2. 输入（键盘 + 触屏）
+ *   3. 关卡数据（瓦片地图 + 实体标记）
+ *   4. 物理与碰撞（AABB 分轴解算）
+ *   5. 实体：玩家 / 敌人 / 收集品 / NPC
+ *   6. 摄像机与渲染
+ *   7. 游戏状态机（标题 / 游戏中 / 通关 / 失败）
+ */
+
+// ==================== 1. 常量 ====================
+const TILE = 32;
+const VIEW_W = 960, VIEW_H = 540;
+
+const GRAVITY = 0.62;
+const MAX_FALL = 14;
+const ACCEL = 0.85;
+const FRICTION = 0.80;
+const AIR_FRICTION = 0.92;
+const MAX_RUN = 4.6;
+const JUMP_V = -11.4;          // 起跳初速
+const JUMP_CUT = 0.42;         // 松手时速度乘数（可变跳跃高度）
+const COYOTE = 7;              // 离开平台后仍可跳的帧数
+const JUMP_BUFFER = 7;         // 落地前按跳的缓冲帧数
+
+// 调色板：冷色为主，标题用暖色点缀
+const C = {
+    sky: '#1b2038',
+    sky2: '#252c4a',
+    far: '#2c3457',
+    near: '#39436b',
+    tileTop: '#5a6b8c',
+    tileBody: '#3d4763',
+    tileEdge: '#7b8db0',
+    player: '#f0c674',
+    playerDark: '#b8913f',
+    paper: '#f4f1e8',
+    paperLine: '#c9c2ab',
+    enemy: '#e06c75',
+    enemyDark: '#a84b52',
+    npc: '#7ec8e3',
+    npcDark: '#4a93ad',
+    text: '#e8ecf4',
+    dim: '#8b93ad',
+    accent: '#e0b155',
+};
+
+// ==================== 2. 工具 ====================
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a, b) => a + Math.random() * (b - a);
+
+function rectsOverlap(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x &&
+           a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// ==================== 3. 输入 ====================
+const Keys = Object.create(null);
+const justPressed = Object.create(null);
+
+window.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
+    if (!Keys[k]) justPressed[k] = true;
+    Keys[k] = true;
+});
+window.addEventListener('keyup', e => {
+    Keys[e.key.toLowerCase()] = false;
+});
+
+// 触屏：左右两个虚拟区 + 跳跃
+const Touch = { left: false, right: false, jump: false };
+function bindTouch(canvas) {
+    const zones = [
+        { id: 'left',  x0: 0,    x1: 0.18 },
+        { id: 'right', x0: 0.18, x1: 0.36 },
+        { id: 'jump',  x0: 0.60, x1: 1.0  },
+    ];
+    const active = new Map();
+
+    function handle(e) {
+        e.preventDefault();
+        Touch.left = Touch.right = Touch.jump = false;
+        for (const t of e.touches) {
+            const r = canvas.getBoundingClientRect();
+            const fx = (t.clientX - r.left) / r.width;
+            const fy = (t.clientY - r.top) / r.height;
+            if (fy > 0.45) {
+                for (const z of zones) {
+                    if (fx >= z.x0 && fx < z.x1) Touch[z.id] = true;
+                }
+            }
+        }
+    }
+    canvas.addEventListener('touchstart', handle, { passive: false });
+    canvas.addEventListener('touchmove', handle, { passive: false });
+    canvas.addEventListener('touchend', handle, { passive: false });
+    canvas.addEventListener('touchcancel', handle, { passive: false });
+}
+
+// 统一的控制查询
+function inputState() {
+    const left  = Keys['a'] || Keys['arrowleft']  || Touch.left;
+    const right = Keys['d'] || Keys['arrowright'] || Touch.right;
+    const jump  = Keys['w'] || Keys[' '] || Keys['arrowup'] || Touch.jump;
+    return { left, right, jump };
+}
+
+// ==================== 4. 关卡 ====================
+// 图例：
+//   .  空        #  地面/砖块      =  单向平台（可从下穿过）
+//   P  玩家出生   R  报告（收集）    D  门（终点）
+//   E  敌人（巡逻）  C  咖啡（加速）  N  小深（对话）
+//   ^  尖刺（碰到扣时间）
+const LEVELS = [
+    {
+        name: '宿舍',
+        hint: '先学会走和跳。A / D 移动，空格跳跃，按住跳得更高。',
+        map: [
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '............................R.......................................................................',
+            '..........................######....................................................................',
+            '......P....N........................E...............C...................E.....................D.....',
+            '##########################################..##################...###################################',
+            '##########################################..##################...###################################',
+            '##########################################..##################...###################################',
+        ],
+    },
+    {
+        name: '实验室',
+        hint: 'ddl 会巡逻，撞上扣时间。咖啡能加速。',
+        map: [
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '............................C.......................................................................',
+            '..........................#####................................C....................................',
+            '....................R...........................####..........####........E...........R.............',
+            '..................######................................................######......#####...........',
+            '......P....N............................E...........................E...........................D...',
+            '##############################...#######################...###################..####################',
+            '##############################...#######################...###################..####################',
+            '##############################...#######################...###################..####################',
+        ],
+    },
+    {
+        name: '教学楼',
+        hint: '最后一关。报告在高台上，一级一级往上跳。',
+        map: [
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '....................................................................................................',
+            '.....................C..............................................................................',
+            '....................####................####.......................E................................',
+            '................R...................R.............................#####.....R.......................',
+            '..............######..............######..................................######....................',
+            '......P.N.....................E.............................E...................................D...',
+            '########################...#################...#################...#################...#############',
+            '########################...#################...#################...#################...#############',
+            '########################...#################...#################...#################...#############',
+        ],
+    },
+];
+
+// 解析地图为对象
+function parseLevel(def) {
+    const rows = def.map;
+    const h = rows.length;
+    const w = Math.max(...rows.map(r => r.length));
+    const grid = [];
+    const spawns = { player: null, enemies: [], reports: [], coffees: [], npcs: [], door: null };
+
+    for (let y = 0; y < h; y++) {
+        const line = rows[y];
+        const row = [];
+        for (let x = 0; x < w; x++) {
+            const ch = x < line.length ? line[x] : '.';
+            let solid = false, platform = false;
+
+            // 1 = 实心砖块，2 = 单向平台，0 = 空
+            if (ch === '#') { solid = true; row.push(1); }
+            else if (ch === '=') { platform = true; row.push(2); }
+            else row.push(0);
+
+            if (ch === 'P') spawns.player = { x: x * TILE, y: y * TILE };
+            else if (ch === 'D') spawns.door = { x: x * TILE, y: y * TILE };
+            else if (ch === 'E') spawns.enemies.push({ x: x * TILE, y: y * TILE });
+            else if (ch === 'R') spawns.reports.push({ x: x * TILE + 16, y: y * TILE + 16 });
+            else if (ch === 'C') spawns.coffees.push({ x: x * TILE + 16, y: y * TILE + 16 });
+            else if (ch === 'N') spawns.npcs.push({ x: x * TILE, y: y * TILE });
+            else if (ch === '^') { row[x] = 2; spawns.spikes = spawns.spikes || []; }
+        }
+        grid.push(row);
+    }
+    return { grid, w, h, spawns, name: def.name, hint: def.hint };
+}
+
+// 瓦片查询
+function tileAt(level, col, row) {
+    if (row < 0 || row >= level.h || col < 0 || col >= level.w) return col < 0 || col >= level.w ? 1 : 0;
+    return level.grid[row][col];
+}
+function isSolidAt(level, col, row) {
+    const t = tileAt(level, col, row);
+    return t === 1;
+}
+function isPlatformAt(level, col, row) {
+    return tileAt(level, col, row) === 2;
+}
+
+// ==================== 5. 玩家 ====================
+class Player {
+    constructor(x, y) {
+        this.x = x; this.y = y;
+        this.w = 22; this.h = 30;
+        this.vx = 0; this.vy = 0;
+        this.onGround = false;
+        this.face = 1;
+        this.coyote = 0;
+        this.buffer = 0;
+        this.jumping = false;
+        this.walkPhase = 0;
+        this.hurtFlash = 0;
+        this.invuln = 0;
+        this.speedBoost = 0;   // 咖啡加速剩余帧
+    }
+
+    update(level) {
+        const { left, right, jump } = inputState();
+
+        // ---- 水平移动 ----
+        const maxSpeed = this.speedBoost > 0 ? MAX_RUN * 1.55 : MAX_RUN;
+        const accel = this.speedBoost > 0 ? ACCEL * 1.4 : ACCEL;
+
+        if (left && !right) { this.vx -= accel; this.face = -1; }
+        else if (right && !left) { this.vx += accel; this.face = 1; }
+        else { this.vx *= this.onGround ? FRICTION : AIR_FRICTION; }
+
+        this.vx = clamp(this.vx, -maxSpeed, maxSpeed);
+        if (Math.abs(this.vx) < 0.08) this.vx = 0;
+
+        // ---- 跳跃：缓冲 + coyote ----
+        if (jump) {
+            if (!this.jumpHeld) this.buffer = JUMP_BUFFER;
+            this.jumpHeld = true;
+        } else {
+            this.jumpHeld = false;
+        }
+        if (this.buffer > 0) this.buffer--;
+        if (this.coyote > 0) this.coyote--;
+
+        if (this.buffer > 0 && this.coyote > 0) {
+            this.vy = JUMP_V;
+            this.buffer = 0;
+            this.coyote = 0;
+            this.jumping = true;
+            this.onGround = false;
+        }
+        // 松手减速（短跳）
+        if (this.jumping && !jump && this.vy < 0) {
+            this.vy *= JUMP_CUT;
+            this.jumping = false;
+        }
+
+        // ---- 重力 ----
+        this.vy += GRAVITY;
+        this.vy = clamp(this.vy, -99, MAX_FALL);
+
+        // ---- 分轴碰撞 ----
+        this.moveX(level);
+        this.moveY(level);
+
+        // ---- 状态衰减 ----
+        if (this.onGround) this.coyote = COYOTE;
+        if (this.hurtFlash > 0) this.hurtFlash--;
+        if (this.invuln > 0) this.invuln--;
+        if (this.speedBoost > 0) this.speedBoost--;
+        if (this.onGround && Math.abs(this.vx) > 0.5) this.walkPhase += 0.22;
+        else if (!this.onGround) this.walkPhase = 0;
+
+        // 掉出世界
+        if (this.y > (level.h - 2) * TILE) return 'fell';
+        return null;
+    }
+
+    moveX(level) {
+        this.x += this.vx;
+        const top = Math.floor(this.y / TILE);
+        const bottom = Math.floor((this.y + this.h - 1) / TILE);
+
+        if (this.vx > 0) {
+            const col = Math.floor((this.x + this.w - 1) / TILE);
+            for (let r = top; r <= bottom; r++) {
+                if (isSolidAt(level, col, r)) {
+                    this.x = col * TILE - this.w;
+                    this.vx = 0;
+                    break;
+                }
+            }
+        } else if (this.vx < 0) {
+            const col = Math.floor(this.x / TILE);
+            for (let r = top; r <= bottom; r++) {
+                if (isSolidAt(level, col, r)) {
+                    this.x = (col + 1) * TILE;
+                    this.vx = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    moveY(level) {
+        this.y += this.vy;
+        const leftC = Math.floor(this.x / TILE);
+        const rightC = Math.floor((this.x + this.w - 1) / TILE);
+
+        if (this.vy > 0) {   // 下落
+            const row = Math.floor((this.y + this.h - 1) / TILE);
+            for (let c = leftC; c <= rightC; c++) {
+                if (isSolidAt(level, c, row)) {
+                    this.y = row * TILE - this.h;
+                    this.vy = 0;
+                    this.onGround = true;
+                    this.jumping = false;
+                    return;
+                }
+                if (isPlatformAt(level, c, row)) {
+                    // 单向平台：只在下落且脚落在平台顶面时接住
+                    const top = row * TILE;
+                    if (this.y + this.h - this.vy <= top + 2) {
+                        this.y = top - this.h;
+                        this.vy = 0;
+                        this.onGround = true;
+                        this.jumping = false;
+                        return;
+                    }
+                }
+            }
+            this.onGround = false;
+        } else if (this.vy < 0) {  // 上升
+            const row = Math.floor(this.y / TILE);
+            for (let c = leftC; c <= rightC; c++) {
+                if (isSolidAt(level, c, row)) {
+                    this.y = (row + 1) * TILE;
+                    this.vy = 0;
+                    return;
+                }
+            }
+            this.onGround = false;
+        } else {
+            // 速度为 0 时检查脚下
+            const row = Math.floor((this.y + this.h) / TILE);
+            let grounded = false;
+            for (let c = leftC; c <= rightC; c++) {
+                if (isSolidAt(level, c, row)) { grounded = true; break; }
+                if (isPlatformAt(level, c, row) && Math.abs(this.y + this.h - row * TILE) < 3) { grounded = true; break; }
+            }
+            this.onGround = grounded;
+        }
+    }
+}
+
+// ==================== 6. 敌人 ====================
+class Enemy {
+    constructor(x, y) {
+        this.x = x; this.y = y + 2;
+        this.w = 26; this.h = 30;
+        this.vx = -0.9;
+        this.vy = 0;
+        this.alive = true;
+        this.phase = rand(0, 6.28);
+    }
+
+    update(level) {
+        this.vy = clamp(this.vy + GRAVITY, -99, MAX_FALL);
+        this.y += this.vy;
+
+        // 落地
+        const row = Math.floor((this.y + this.h - 1) / TILE);
+        const lc = Math.floor(this.x / TILE), rc = Math.floor((this.x + this.w - 1) / TILE);
+        for (let c = lc; c <= rc; c++) {
+            if (isSolidAt(level, c, row)) {
+                this.y = row * TILE - this.h;
+                this.vy = 0;
+                break;
+            }
+        }
+
+        // 水平巡逻：撞墙或前方无路就掉头
+        const nextX = this.x + this.vx;
+        const frontCol = this.vx > 0 ? Math.floor((nextX + this.w) / TILE) : Math.floor(nextX / TILE);
+        const bodyRow = Math.floor((this.y + this.h / 2) / TILE);
+        const footRow = Math.floor((this.y + this.h + 4) / TILE);
+
+        const hitWall = isSolidAt(level, frontCol, bodyRow);
+        const noFloor = !isSolidAt(level, frontCol, footRow) && !isPlatformAt(level, frontCol, footRow);
+
+        if (hitWall || (noFloor && this.vy === 0)) {
+            this.vx = -this.vx;
+        } else {
+            this.x = nextX;
+        }
+
+        this.phase += 0.12;
+    }
+}
+
+// ==================== 7. 游戏主体 ====================
+const Game = {
+    state: 'title',        // title | playing | clear | fail
+    levelIndex: 0,
+    level: null,
+    player: null,
+    enemies: [],
+    reports: [],
+    coffees: [],
+    npcs: [],
+    door: null,
+    camX: 0,
+    camY: 0,
+    timeLeft: 0,
+    totalTime: 0,
+    collected: 0,
+    totalReports: 0,
+    message: '',
+    messageTimer: 0,
+    npcTalk: null,
+    shake: 0,
+    tick: 0,
+    particles: [],
+
+    startLevel(i) {
+        this.levelIndex = i;
+        const def = LEVELS[i];
+        this.level = parseLevel(def);
+        const sp = this.level.spawns;
+
+        this.player = new Player(sp.player.x, sp.player.y);
+        this.enemies = sp.enemies.map(e => new Enemy(e.x, e.y));
+        this.reports = sp.reports.map(r => ({ ...r, got: false, bob: rand(0, 6.28) }));
+        this.coffees = sp.coffees.map(c => ({ ...c, got: false, bob: rand(0, 6.28) }));
+        this.npcs = sp.npcs.map(n => ({ ...n, said: false }));
+        this.door = sp.door;
+
+        this.totalReports = this.reports.length;
+        this.collected = 0;
+        this.timeLeft = 60 + this.totalReports * 12;
+        this.totalTime = this.timeLeft;
+        this.camX = 0; this.camY = 0;
+        this.shake = 0;
+        this.particles = [];
+        this.doorMsgCd = 0;
+        this.state = 'playing';
+        this.showMessage(def.hint, 180);
+    },
+
+    showMessage(text, frames) {
+        this.message = text;
+        this.messageTimer = frames;
+    },
+
+    update() {
+        if (this.state !== 'playing') return;
+        this.tick++;
+
+        // 计时
+        this.timeLeft -= 1 / 60;
+        if (this.timeLeft <= 0) {
+            this.timeLeft = 0;
+            this.state = 'fail';
+            return;
+        }
+
+        const p = this.player;
+        const r = p.update(this.level);
+
+        if (r === 'fell') {
+            this.state = 'fail';
+            return;
+        }
+
+        // ---- 敌人 ----
+        for (const e of this.enemies) {
+            if (!e.alive) continue;
+            e.update(this.level);
+            if (p.invuln <= 0 && rectsOverlap(p, e)) {
+                this.hurt(8, '被 ddl 撞了');
+            }
+        }
+
+        // ---- 收集报告 ----
+        for (const rep of this.reports) {
+            if (rep.got) continue;
+            const box = { x: rep.x - 14, y: rep.y - 18, w: 28, h: 36 };
+            if (rectsOverlap(p, box)) {
+                rep.got = true;
+                this.collected++;
+                this.burst(rep.x, rep.y, C.paper, 14);
+                this.showMessage(`拿到第 ${this.collected}/${this.totalReports} 份报告`, 90);
+            }
+        }
+
+        // ---- 咖啡 ----
+        for (const cf of this.coffees) {
+            if (cf.got) continue;
+            const box = { x: cf.x - 12, y: cf.y - 16, w: 24, h: 32 };
+            if (rectsOverlap(p, box)) {
+                cf.got = true;
+                p.speedBoost = 300;
+                this.burst(cf.x, cf.y, C.accent, 12);
+                this.showMessage('咖啡！速度提升 5 秒', 90);
+            }
+        }
+
+        // ---- NPC 对话 ----
+        for (const n of this.npcs) {
+            if (n.said) continue;
+            const box = { x: n.x - 20, y: n.y - 20, w: 72, h: 60 };
+            if (rectsOverlap(p, box)) {
+                n.said = true;
+                this.npcTalk = { text: NPC_LINES[this.levelIndex % NPC_LINES.length], t: 240 };
+            }
+        }
+        if (this.npcTalk) {
+            this.npcTalk.t--;
+            if (this.npcTalk.t <= 0) this.npcTalk = null;
+        }
+
+        // ---- 门 ----
+        const doorBox = { x: this.door.x + 4, y: this.door.y - 4, w: 24, h: 40 };
+        if (rectsOverlap(p, doorBox)) {
+            if (this.collected >= this.totalReports) {
+                this.state = 'clear';
+            } else if (this.doorMsgCd <= 0) {
+                // 门口提示优先于普通提示，加 50 帧冷却防刷屏
+                this.showMessage(`还差 ${this.totalReports - this.collected} 份报告`, 60);
+                this.doorMsgCd = 50;
+            }
+        }
+
+        // ---- 摄像机 ----
+        const targetX = p.x + p.w / 2 - VIEW_W / 2;
+        const targetY = p.y + p.h / 2 - VIEW_H / 2 - 20;
+        this.camX = lerp(this.camX, targetX, 0.12);
+        this.camY = lerp(this.camY, targetY, 0.10);
+        this.camX = clamp(this.camX, 0, this.level.w * TILE - VIEW_W);
+        this.camY = clamp(this.camY, -80, this.level.h * TILE - VIEW_H + 60);
+
+        // ---- 杂项 ----
+        if (this.messageTimer > 0) this.messageTimer--;
+        if (this.doorMsgCd > 0) this.doorMsgCd--;
+        if (this.shake > 0) this.shake *= 0.88;
+        for (let i = this.particles.length - 1; i >= 0; i--) {
+            const pt = this.particles[i];
+            pt.x += pt.vx; pt.y += pt.vy; pt.vy += 0.22; pt.life--;
+            if (pt.life <= 0) this.particles.splice(i, 1);
+        }
+        for (const rep of this.reports) rep.bob += 0.07;
+        for (const cf of this.coffees) cf.bob += 0.09;
+    },
+
+    hurt(sec, why) {
+        this.timeLeft = Math.max(0, this.timeLeft - sec);
+        this.player.invuln = 60;
+        this.player.hurtFlash = 20;
+        this.shake = 8;
+        this.showMessage(`${why}  时间 -${sec} 秒`, 90);
+    },
+
+    burst(x, y, color, n) {
+        for (let i = 0; i < n; i++) {
+            this.particles.push({
+                x, y,
+                vx: rand(-3, 3), vy: rand(-4, 1),
+                life: rand(18, 34), color,
+            });
+        }
+    },
+};
+
+const NPC_LINES = [
+    '小深：这个平台能跳上去，别看它高。',
+    '小深：ddl 是撞不得的，绕开就行。',
+    '小深：报告凑齐了门才开，别急着跑。',
+];
+// ==================== 8. 渲染 ====================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+function resize() {
+    const scale = Math.min(window.innerWidth / VIEW_W, window.innerHeight / VIEW_H);
+    canvas.style.width = (VIEW_W * scale) + 'px';
+    canvas.style.height = (VIEW_H * scale) + 'px';
+    canvas.width = VIEW_W;
+    canvas.height = VIEW_H;
+}
+window.addEventListener('resize', resize);
+
+// ---------- 背景 ----------
+function drawBackground(camX, camY) {
+    // 天空渐变
+    const g = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+    g.addColorStop(0, C.sky);
+    g.addColorStop(1, C.sky2);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+    // 远景楼群（视差 0.2）
+    const px1 = camX * 0.2;
+    ctx.fillStyle = C.far;
+    for (let i = 0; i < 40; i++) {
+        const bx = (i * 180 - px1) % (40 * 180);
+        const bh = 90 + ((i * 37) % 130);
+        ctx.fillRect(bx, VIEW_H - bh - 60, 110, bh);
+        // 窗
+        ctx.fillStyle = 'rgba(255,220,150,0.10)';
+        for (let wy = 0; wy < Math.floor(bh / 34); wy++) {
+            for (let wx = 0; wx < 3; wx++) {
+                if ((i + wy + wx) % 3 === 0) {
+                    ctx.fillRect(bx + 14 + wx * 30, VIEW_H - bh - 46 + wy * 32, 16, 16);
+                }
+            }
+        }
+        ctx.fillStyle = C.far;
+    }
+
+    // 近景楼群（视差 0.45）
+    const px2 = camX * 0.45;
+    ctx.fillStyle = C.near;
+    for (let i = 0; i < 40; i++) {
+        const bx = (i * 240 - px2) % (40 * 240);
+        const bh = 130 + ((i * 53) % 90);
+        ctx.fillRect(bx, VIEW_H - bh - 20, 150, bh);
+    }
+}
+
+// ---------- 瓦片 ----------
+function drawTiles(level, camX, camY) {
+    const c0 = Math.max(0, Math.floor(camX / TILE));
+    const c1 = Math.min(level.w - 1, Math.ceil((camX + VIEW_W) / TILE));
+    const r0 = Math.max(0, Math.floor(camY / TILE));
+    const r1 = Math.min(level.h - 1, Math.ceil((camY + VIEW_H) / TILE));
+
+    for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+            const t = level.grid[r][c];
+            if (!t) continue;
+            const x = Math.round(c * TILE - camX);
+            const y = Math.round(r * TILE - camY);
+
+            if (t === 1) {
+                // 砖块
+                ctx.fillStyle = C.tileBody;
+                ctx.fillRect(x, y, TILE, TILE);
+                // 顶面亮线
+                const above = isSolidAt(level, c, r - 1);
+                if (!above) {
+                    ctx.fillStyle = C.tileTop;
+                    ctx.fillRect(x, y, TILE, 7);
+                    ctx.fillStyle = C.tileEdge;
+                    ctx.fillRect(x, y, TILE, 2);
+                }
+                // 砖缝
+                ctx.fillStyle = 'rgba(0,0,0,0.16)';
+                ctx.fillRect(x, y + TILE - 2, TILE, 2);
+                if ((c + r) % 2 === 0) ctx.fillRect(x + TILE - 2, y, 2, TILE);
+            } else if (t === 2) {
+                // 单向平台
+                ctx.fillStyle = '#6b7a9e';
+                ctx.fillRect(x, y, TILE, 8);
+                ctx.fillStyle = C.tileEdge;
+                ctx.fillRect(x, y, TILE, 2);
+                ctx.fillStyle = 'rgba(0,0,0,0.2)';
+                ctx.fillRect(x, y + 8, TILE, 2);
+            }
+        }
+    }
+}
+
+// ---------- 玩家 ----------
+function drawPlayer(p, camX, camY, tick) {
+    const x = Math.round(p.x - camX);
+    const y = Math.round(p.y - camY);
+
+    if (p.invuln > 0 && Math.floor(tick / 4) % 2 === 0) return;  // 受损闪烁
+
+    const flip = p.face < 0;
+    ctx.save();
+    if (flip) {
+        ctx.translate(x + p.w / 2, 0);
+        ctx.scale(-1, 1);
+        ctx.translate(-(x + p.w / 2), 0);
+    }
+
+    const body = p.hurtFlash > 0 ? '#ffffff' : C.player;
+    const dark = p.hurtFlash > 0 ? '#ffffff' : C.playerDark;
+
+    // 腿（走路摆动）
+    const swing = p.onGround ? Math.sin(p.walkPhase) * 4 : -2;
+    ctx.fillStyle = dark;
+    ctx.fillRect(x + 3, y + p.h - 8 + swing, 6, 8 - swing);
+    ctx.fillRect(x + p.w - 9, y + p.h - 8 - swing, 6, 8 + swing);
+
+    // 身体
+    ctx.fillStyle = body;
+    ctx.fillRect(x + 2, y + 10, p.w - 4, p.h - 18);
+
+    // 头
+    ctx.fillStyle = body;
+    ctx.fillRect(x + 4, y, p.w - 8, 12);
+    // 头发
+    ctx.fillStyle = '#3a2f22';
+    ctx.fillRect(x + 4, y, p.w - 8, 4);
+
+    // 眼睛（朝向前方）
+    ctx.fillStyle = '#1b2038';
+    ctx.fillRect(x + p.w - 8, y + 6, 2, 3);
+    ctx.fillRect(x + p.w - 13, y + 6, 2, 3);
+
+    // 加速时的拖影光
+    if (p.speedBoost > 0) {
+        ctx.fillStyle = 'rgba(224,177,85,0.35)';
+        ctx.fillRect(x - 6, y + 6, 6, p.h - 12);
+    }
+
+    ctx.restore();
+}
+
+// ---------- 敌人 ----------
+function drawEnemy(e, camX, camY) {
+    if (!e.alive) return;
+    const x = Math.round(e.x - camX);
+    const y = Math.round(e.y - camY);
+    const wob = Math.sin(e.phase) * 2;
+
+    // 身体
+    ctx.fillStyle = C.enemyDark;
+    ctx.fillRect(x, y + 4, e.w, e.h - 4);
+    ctx.fillStyle = C.enemy;
+    ctx.fillRect(x + 2, y + wob * 0.3, e.w - 4, e.h - 6);
+
+    // 尖刺
+    ctx.fillStyle = C.enemyDark;
+    for (let i = 0; i < 3; i++) {
+        ctx.beginPath();
+        ctx.moveTo(x + 3 + i * 8, y);
+        ctx.lineTo(x + 7 + i * 8, y - 6);
+        ctx.lineTo(x + 11 + i * 8, y);
+        ctx.closePath();
+        ctx.fill();
+    }
+
+    // 眼睛
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(x + 6, y + 10, 5, 5);
+    ctx.fillRect(x + e.w - 11, y + 10, 5, 5);
+    ctx.fillStyle = '#1b2038';
+    const look = e.vx > 0 ? 2 : 0;
+    ctx.fillRect(x + 7 + look, y + 11, 2, 3);
+    ctx.fillRect(x + e.w - 10 + look, y + 11, 2, 3);
+
+    // 腿
+    ctx.fillStyle = C.enemyDark;
+    ctx.fillRect(x + 3, y + e.h - 2, 6, 3);
+    ctx.fillRect(x + e.w - 9, y + e.h - 2, 6, 3);
+}
+
+// ---------- 报告 ----------
+function drawReport(rep, camX, camY) {
+    if (rep.got) return;
+    const bobY = Math.sin(rep.bob) * 4;
+    const x = Math.round(rep.x - camX);
+    const y = Math.round(rep.y - camY + bobY);
+
+    // 光晕
+    ctx.fillStyle = 'rgba(244,241,232,0.12)';
+    ctx.beginPath();
+    ctx.arc(x, y, 20, 0, 6.28);
+    ctx.fill();
+
+    // 纸
+    ctx.fillStyle = C.paper;
+    ctx.fillRect(x - 9, y - 12, 18, 24);
+    // 折角
+    ctx.fillStyle = '#d8d3c2';
+    ctx.beginPath();
+    ctx.moveTo(x + 3, y - 12);
+    ctx.lineTo(x + 9, y - 12);
+    ctx.lineTo(x + 9, y - 6);
+    ctx.closePath();
+    ctx.fill();
+    // 横线
+    ctx.fillStyle = C.paperLine;
+    for (let i = 0; i < 4; i++) ctx.fillRect(x - 6, y - 6 + i * 5, 12, 1);
+}
+
+// ---------- 咖啡 ----------
+function drawCoffee(cf, camX, camY) {
+    if (cf.got) return;
+    const bobY = Math.sin(cf.bob) * 3;
+    const x = Math.round(cf.x - camX);
+    const y = Math.round(cf.y - camY + bobY);
+
+    ctx.fillStyle = 'rgba(224,177,85,0.16)';
+    ctx.beginPath();
+    ctx.arc(x, y, 18, 0, 6.28);
+    ctx.fill();
+
+    // 杯身
+    ctx.fillStyle = '#e8e4d8';
+    ctx.fillRect(x - 7, y - 6, 14, 15);
+    // 咖啡液
+    ctx.fillStyle = '#6b4226';
+    ctx.fillRect(x - 6, y - 3, 12, 6);
+    // 把手
+    ctx.strokeStyle = '#e8e4d8';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(x + 9, y + 1, 4, -1.2, 1.2);
+    ctx.stroke();
+    // 热气
+    ctx.strokeStyle = 'rgba(232,228,216,0.5)';
+    ctx.lineWidth = 1.5;
+    for (let i = 0; i < 2; i++) {
+        ctx.beginPath();
+        ctx.moveTo(x - 3 + i * 6, y - 9);
+        ctx.quadraticCurveTo(x - 5 + i * 6, y - 14, x - 3 + i * 6, y - 19);
+        ctx.stroke();
+    }
+}
+
+// ---------- NPC 小深 ----------
+function drawNpc(n, camX, camY, tick) {
+    const x = Math.round(n.x - camX);
+    const y = Math.round(n.y - camY);
+    const float = Math.sin(tick * 0.05) * 3;
+
+    // 光晕
+    ctx.fillStyle = 'rgba(126,200,227,0.10)';
+    ctx.beginPath();
+    ctx.arc(x + 12, y + 14 + float, 26, 0, 6.28);
+    ctx.fill();
+
+    // 身体（小一点，漂浮）
+    ctx.fillStyle = C.npcDark;
+    ctx.fillRect(x + 4, y + 8 + float, 16, 20);
+    ctx.fillStyle = C.npc;
+    ctx.fillRect(x + 5, y + 9 + float, 14, 18);
+    // 头
+    ctx.fillStyle = C.npc;
+    ctx.fillRect(x + 6, y + float, 12, 10);
+    // 眼睛
+    ctx.fillStyle = '#1b2038';
+    ctx.fillRect(x + 9, y + 4 + float, 2, 3);
+    ctx.fillRect(x + 14, y + 4 + float, 2, 3);
+    // 呆毛
+    ctx.strokeStyle = C.npc;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x + 12, y + float);
+    ctx.quadraticCurveTo(x + 16, y - 6 + float, x + 13, y - 9 + float);
+    ctx.stroke();
+}
+
+// ---------- 门 ----------
+function drawDoor(door, camX, camY, open, tick) {
+    const x = Math.round(door.x - camX);
+    const y = Math.round(door.y - camY);
+
+    // 门框
+    ctx.fillStyle = open ? '#4a7c59' : '#4a4a5e';
+    ctx.fillRect(x, y - 4, TILE, TILE + 4);
+    // 门内
+    ctx.fillStyle = open ? '#2e5c3c' : '#2a2a38';
+    ctx.fillRect(x + 4, y, TILE - 8, TILE);
+    // 把手
+    ctx.fillStyle = open ? C.accent : '#6b6b80';
+    ctx.fillRect(x + TILE - 12, y + TILE / 2, 3, 3);
+
+    if (open) {
+        // 门口的光
+        const a = 0.12 + Math.sin(tick * 0.08) * 0.05;
+        ctx.fillStyle = `rgba(224,177,85,${a})`;
+        ctx.fillRect(x - 12, y - 20, TILE + 24, TILE + 20);
+    }
+}
+
+// ---------- 粒子 ----------
+function drawParticles(parts, camX, camY) {
+    for (const pt of parts) {
+        const a = clamp(pt.life / 30, 0, 1);
+        ctx.globalAlpha = a;
+        ctx.fillStyle = pt.color;
+        ctx.fillRect(Math.round(pt.x - camX), Math.round(pt.y - camY), 3, 3);
+    }
+    ctx.globalAlpha = 1;
+}
+
+// ---------- HUD ----------
+function drawHUD(g) {
+    // 时间条
+    const barW = 240, barH = 14;
+    const bx = 24, by = 20;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(bx - 2, by - 2, barW + 4, barH + 4);
+
+    const ratio = g.timeLeft / g.totalTime;
+    const col = ratio > 0.5 ? '#5aa469' : (ratio > 0.22 ? C.accent : C.enemy);
+    ctx.fillStyle = '#2a2a38';
+    ctx.fillRect(bx, by, barW, barH);
+    ctx.fillStyle = col;
+    ctx.fillRect(bx, by, barW * ratio, barH);
+
+    ctx.fillStyle = C.text;
+    ctx.font = 'bold 13px "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`截止 ${Math.ceil(g.timeLeft)} 秒`, bx + barW + 12, by + barH / 2);
+
+    // 报告计数
+    const rx = VIEW_W - 150, ry = 18;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(rx - 8, ry - 6, 132, 30);
+    // 小图标
+    ctx.fillStyle = C.paper;
+    ctx.fillRect(rx, ry, 12, 16);
+    ctx.fillStyle = C.paperLine;
+    for (let i = 0; i < 3; i++) ctx.fillRect(rx + 2, ry + 4 + i * 4, 8, 1);
+
+    ctx.fillStyle = C.text;
+    ctx.font = 'bold 16px "Microsoft YaHei", sans-serif';
+    ctx.fillText(`${g.collected} / ${g.totalReports}`, rx + 22, ry + 8);
+
+    // 关卡名
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 14px "Microsoft YaHei", sans-serif';
+    ctx.fillStyle = C.dim;
+    ctx.fillText(`第 ${g.levelIndex + 1} 关　${g.level.name}`, VIEW_W / 2, 26);
+
+    // 提示消息
+    if (g.messageTimer > 0) {
+        const a = clamp(g.messageTimer / 40, 0, 1);
+        ctx.globalAlpha = a;
+        ctx.font = 'bold 18px "Microsoft YaHei", sans-serif';
+        const tw = ctx.measureText(g.message).width;
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(VIEW_W / 2 - tw / 2 - 18, VIEW_H - 100, tw + 36, 40);
+        ctx.fillStyle = C.text;
+        ctx.fillText(g.message, VIEW_W / 2, VIEW_H - 80);
+        ctx.globalAlpha = 1;
+    }
+
+    // 小深对话
+    if (g.npcTalk) {
+        ctx.textAlign = 'left';
+        ctx.font = 'bold 15px "Microsoft YaHei", sans-serif';
+        const tw = ctx.measureText(g.npcTalk.text).width;
+        const bx2 = 40, by2 = VIEW_H - 190;
+        // 气泡
+        ctx.fillStyle = 'rgba(126,200,227,0.92)';
+        ctx.fillRect(bx2, by2, tw + 32, 44);
+        ctx.fillStyle = '#1b2038';
+        ctx.fillText(g.npcTalk.text, bx2 + 16, by2 + 22);
+        // 小尾巴
+        ctx.fillStyle = 'rgba(126,200,227,0.92)';
+        ctx.beginPath();
+        ctx.moveTo(bx2 + 24, by2 + 44);
+        ctx.lineTo(bx2 + 36, by2 + 44);
+        ctx.lineTo(bx2 + 26, by2 + 54);
+        ctx.closePath();
+        ctx.fill();
+    }
+}
+
+// ---------- 状态界面 ----------
+function drawTitle(tick) {
+    ctx.fillStyle = 'rgba(12,15,26,0.92)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+    // 装饰线
+    ctx.strokeStyle = 'rgba(224,177,85,0.25)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 6; i++) {
+        const y = 120 + i * 60;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(VIEW_W, y);
+        ctx.stroke();
+    }
+
+    ctx.textAlign = 'center';
+
+    // 标题
+    const float = Math.sin(tick * 0.04) * 4;
+    ctx.font = 'bold 72px "Microsoft YaHei", sans-serif';
+    ctx.fillStyle = C.accent;
+    ctx.fillText('赶 报 告', VIEW_W / 2, 200 + float);
+
+    ctx.font = 'bold 20px "Microsoft YaHei", sans-serif';
+    ctx.fillStyle = C.dim;
+    ctx.fillText('一个关于期末的小游戏', VIEW_W / 2, 248 + float);
+
+    // 操作说明
+    ctx.font = 'bold 17px "Microsoft YaHei", sans-serif';
+    ctx.fillStyle = C.text;
+    const lines = [
+        'A / D 或 ← → 移动　　空格 / W 跳跃',
+        '收集所有报告，别让倒计时归零',
+        'ddl 撞不得，咖啡能加速',
+    ];
+    lines.forEach((t, i) => ctx.fillText(t, VIEW_W / 2, 330 + i * 34));
+
+    // 开始提示
+    const blink = Math.floor(tick / 30) % 2 === 0;
+    if (blink) {
+        ctx.font = 'bold 24px "Microsoft YaHei", sans-serif';
+        ctx.fillStyle = C.player;
+        ctx.fillText('按 空格 开始', VIEW_W / 2, 470);
+    }
+}
+
+function drawEnd(g, win, tick) {
+    ctx.fillStyle = 'rgba(12,15,26,0.90)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.textAlign = 'center';
+
+    if (win) {
+        ctx.font = 'bold 56px "Microsoft YaHei", sans-serif';
+        ctx.fillStyle = C.tone || '#8fd18f';
+        ctx.fillText('赶完了', VIEW_W / 2, 200);
+
+        ctx.font = 'bold 20px "Microsoft YaHei", sans-serif';
+        ctx.fillStyle = C.text;
+        ctx.fillText(`用时 ${Math.ceil(g.totalTime - g.timeLeft)} 秒　剩余 ${Math.ceil(g.timeLeft)} 秒`, VIEW_W / 2, 260);
+
+        // 小深的评语
+        ctx.font = 'bold 22px "Microsoft YaHei", sans-serif';
+        ctx.fillStyle = C.npc;
+        const quips = [
+            '小深：就这？我还以为多难。',
+            '小深：交了吧，别拖了。',
+            '小深：干得还行，勉强夸你一句。',
+        ];
+        ctx.fillText(quips[g.levelIndex % quips.length], VIEW_W / 2, 330);
+    } else {
+        ctx.font = 'bold 56px "Microsoft YaHei", sans-serif';
+        ctx.fillStyle = C.enemy;
+        ctx.fillText('来不及了', VIEW_W / 2, 210);
+
+        ctx.font = 'bold 20px "Microsoft YaHei", sans-serif';
+        ctx.fillStyle = C.text;
+        ctx.fillText(`报告 ${g.collected} / ${g.totalReports}`, VIEW_W / 2, 270);
+
+        ctx.font = 'bold 22px "Microsoft YaHei", sans-serif';
+        ctx.fillStyle = C.npc;
+        ctx.fillText('小深：重来一次呗，又不丢人。', VIEW_W / 2, 330);
+    }
+
+    const blink = Math.floor(tick / 30) % 2 === 0;
+    if (blink) {
+        ctx.font = 'bold 22px "Microsoft YaHei", sans-serif';
+        ctx.fillStyle = C.player;
+        ctx.fillText('按 空格 继续', VIEW_W / 2, 450);
+    }
+}
+
+// ---------- 主绘制 ----------
+function render(g, tick) {
+    if (g.state === 'title') {
+        drawTitle(tick);
+        return;
+    }
+
+    const shakeX = g.shake > 0.5 ? rand(-g.shake, g.shake) : 0;
+    const shakeY = g.shake > 0.5 ? rand(-g.shake, g.shake) : 0;
+    const camX = g.camX - shakeX;
+    const camY = g.camY - shakeY;
+
+    drawBackground(camX, camY);
+    drawTiles(g.level, camX, camY);
+
+    // 门
+    const allGot = g.collected >= g.totalReports;
+    drawDoor(g.door, camX, camY, allGot, tick);
+
+    // 收集品
+    for (const cf of g.coffees) drawCoffee(cf, camX, camY);
+    for (const rep of g.reports) drawReport(rep, camX, camY);
+    for (const n of g.npcs) drawNpc(n, camX, camY, tick);
+
+    // 敌人
+    for (const e of g.enemies) drawEnemy(e, camX, camY);
+
+    // 玩家
+    drawPlayer(g.player, camX, camY, tick);
+
+    // 粒子
+    drawParticles(g.particles, camX, camY);
+
+    // HUD
+    drawHUD(g);
+
+    // 结束界面
+    if (g.state === 'clear') drawEnd(g, true, tick);
+    else if (g.state === 'fail') drawEnd(g, false, tick);
+
+    // 触屏提示（仅移动端）
+    if ('ontouchstart' in window && g.state === 'playing') {
+        ctx.globalAlpha = 0.18;
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(40, VIEW_H - 120, 70, 70);
+        ctx.fillRect(130, VIEW_H - 120, 70, 70);
+        ctx.fillRect(VIEW_W - 130, VIEW_H - 120, 90, 70);
+        ctx.globalAlpha = 1;
+    }
+}
+// ==================== 9. 主循环与状态机 ====================
+let lastTime = 0;
+let acc = 0;
+const STEP = 1000 / 60;
+let tick = 0;
+
+function handleConfirm() {
+    const g = Game;
+    if (g.state === 'title') {
+        g.startLevel(0);
+    } else if (g.state === 'clear') {
+        if (g.levelIndex + 1 < LEVELS.length) {
+            g.startLevel(g.levelIndex + 1);
+        } else {
+            // 全部通关：回到标题并标记完成
+            g.state = 'title';
+            g.allClear = true;
+        }
+    } else if (g.state === 'fail') {
+        g.startLevel(g.levelIndex);
+    }
+}
+
+window.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (k === ' ' || k === 'enter') {
+        if (Game.state !== 'playing') handleConfirm();
+    }
+    if (k === 'r' && Game.state === 'playing') {
+        Game.startLevel(Game.levelIndex);
+    }
+});
+
+// 触屏点击也能确认
+canvas.addEventListener('touchend', e => {
+    if (Game.state !== 'playing') {
+        handleConfirm();
+    }
+});
+
+function loop(now) {
+    requestAnimationFrame(loop);
+
+    if (!lastTime) lastTime = now;
+    let delta = now - lastTime;
+    lastTime = now;
+    if (delta > 200) delta = 200;   // 切标签页回来别一次性补太多
+
+    acc += delta;
+    let steps = 0;
+    while (acc >= STEP && steps < 5) {
+        tick++;
+        Game.update();
+        acc -= STEP;
+        steps++;
+    }
+
+    render(Game, tick);
+}
+
+// ---------- 启动 ----------
+resize();
+bindTouch(canvas);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
