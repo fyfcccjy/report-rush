@@ -4,8 +4,9 @@
 
 **单文件 HTML5，零依赖，双击就能玩。** 没有引擎、没有构建、没有 npm install。
 
-> 在线试玩：[GitHub Pages 链接待填]
-> 下载：[index.html](index.html) 右键另存，双击打开即可。
+> ### ▶ [点这里在线玩](https://fyfcccjy.github.io/report-rush/)
+>
+> 也可以下载 [index.html](index.html) 离线玩，双击打开即可。
 
 ![标题界面](screenshots/title.png)
 
