@@ -1,117 +1,113 @@
-# 赶报告
+# Report Rush
 
-一个像素风的横版闯关小游戏。扮一个大学生，在宿舍、实验室、教学楼之间穿行，赶在 deadline 之前把实验报告收齐。
+**赶报告** — A pixel-art side-scrolling platformer about finishing lab reports before the deadline.
 
-**单文件 HTML5，零依赖，双击就能玩。** 没有引擎、没有构建、没有 npm install。
+A student runs through a dormitory, a laboratory, and a teaching building, collecting every lab report before time runs out.
 
-> ### ▶ [点这里在线玩](https://fyfcccjy.github.io/report-rush/)
+**Single-file HTML5. No engine, no build step, no dependencies.** Open `index.html` and play.
+
+> ### ▶ [Play in browser](https://fyfcccjy.github.io/report-rush/)
 >
-> 也可以下载 [index.html](index.html) 离线玩，双击打开即可。
+> Or download [index.html](index.html) and open it locally — the game is fully offline.
 
-![标题界面](screenshots/title.png)
+![Title screen](screenshots/title.png)
 
-## 玩法
+## How to Play
 
-| 操作 | 按键 |
+| Action | Keys |
 |---|---|
-| 移动 | `A` / `D` 或 `←` `→` |
-| 跳跃 | `空格` / `W` / `↑`（**按住跳得更高**） |
-| 重开本关 | `R` |
+| Move | `A` / `D` or `←` `→` |
+| Jump | `Space` / `W` / `↑` — hold to jump higher |
+| Restart level | `R` |
 
-手机端也能玩：屏幕左下两个区域是左右移动，右下角是跳跃。
+Touch controls are available on mobile: two zones at the bottom left for movement, one at the bottom right for jumping.
 
-三关：**宿舍 → 实验室 → 教学楼**。每关散落着若干份实验报告，**全部收集后门才会开**，走进去才算过关。倒计时归零或掉下坑都算失败。
+The game has three levels. Each level scatters several lab reports across the map; **the exit only opens once all of them are collected**. Reaching the exit clears the level. The run ends if the timer reaches zero or the player falls into a pit.
 
-路上会遇到：
+Hazards and pickups:
 
-- **ddl 小怪** 来回巡逻，撞上扣 8 秒
-- **咖啡** 让移动速度提升 5 秒
-- **小深** 蹲在每关起点附近，走近会说话
+- **Deadline creatures** patrol the ground — touching one costs 8 seconds
+- **Coffee** increases movement speed for 5 seconds
+- **Xiaoshen**, an NPC near each level's starting point, offers hints when approached
 
-## 截图
+## Screenshots
 
-| 第 1 关 · 宿舍 | 第 3 关 · 教学楼 |
+| Level 1 — Dormitory | Level 3 — Teaching Building |
 |---|---|
-| ![宿舍](screenshots/level1.png) | ![教学楼](screenshots/level3.png) |
+| ![Dormitory](screenshots/level1.png) | ![Teaching building](screenshots/level3.png) |
 
-## 技术上做了什么
+## Implementation
 
-全部手写，没有引入任何游戏引擎。
+The game is written from scratch without any game engine or framework.
 
-**瓦片地图**用字符串数组描述，改关卡就是改字符：
-
-```
-#  砖块        =  单向平台（可从下方穿过）
-P  出生点      D  终点门
-R  报告        E  敌人
-C  咖啡        N  NPC
-```
-
-**AABB 分轴碰撞**：先解算 X 轴再解算 Y 轴，避免高速移动时卡进墙里。
-
-**手感三件套**（这三个是横版跳跃游戏好不好玩的关键）：
-
-- **可变跳跃高度** —— 松开跳跃键时，上升速度乘 0.42，按得越久跳得越高
-- **Coyote time** —— 离开平台后 7 帧内仍然可以起跳，容错边缘操作
-- **跳跃缓冲** —— 落地前 7 帧按下跳跃键，落地瞬间自动起跳
-
-**视差背景**：两层楼群按不同比例跟随镜头移动。
-
-**粒子、震屏、飘字**：受击时屏幕抖动，收集时有粒子迸发。
-
-## 本地运行
-
-不需要任何工具链：
+**Tile map.** Levels are described as arrays of strings, so editing a level means editing characters:
 
 ```
-直接双击 index.html
+#  solid tile        =  one-way platform (passable from below)
+P  spawn point       D  exit door
+R  report            E  enemy
+C  coffee            N  NPC
 ```
 
-想改的话，`src/` 下是分开的源文件：
+**AABB collision, resolved per axis.** Horizontal movement is resolved before vertical movement, which prevents the player from tunnelling through walls at high speed.
 
-| 文件 | 作用 |
+**Movement feel.** Three details separate a responsive platformer from a sluggish one, and all three are implemented here:
+
+- **Variable jump height** — releasing the jump key multiplies upward velocity by 0.42, so tapping produces a short hop and holding produces a full jump
+- **Coyote time** — the player may still jump for 7 frames after walking off a ledge
+- **Jump buffering** — a jump pressed up to 7 frames before landing is executed on touchdown
+
+**Parallax background.** Two layers of buildings scroll at different rates relative to the camera.
+
+**Feedback.** Particles on pickup, screen shake on damage, and floating messages.
+
+## Running Locally
+
+No toolchain is required. Open `index.html` in a browser.
+
+The `src/` directory contains the same code split into readable modules:
+
+| File | Responsibility |
 |---|---|
-| `core.js` | 游戏逻辑：物理、碰撞、实体、状态机 |
-| `render.js` | 渲染：瓦片、角色、UI、特效 |
-| `main.js` | 主循环、输入、状态切换 |
-| `gen_levels.py` | 关卡生成器（带可通过性检查） |
+| `core.js` | Game logic: physics, collision, entities, state machine |
+| `render.js` | Rendering: tiles, characters, UI, effects |
+| `main.js` | Main loop, input handling, state transitions |
+| `gen_levels.py` | Level generator with reachability checks |
 
-改完源文件后，把它们拼回单文件即可（或者直接用浏览器打开一个本地服务器跑 `src/` 版本）。
+After editing the modules, concatenate them back into the single-file build, or serve `src/` through a local HTTP server.
 
-## 测试
+## Testing
 
-三个自动测试，都在 `src/` 下，用 Node 直接跑：
+Three automated test suites, runnable with Node:
 
 ```bash
-node src/test_logic.js    # 物理、碰撞、收集、状态机（29 项）
-node src/test_levels.js   # 关卡可通过性：坑宽、台阶高度
-node src/test_bot.js      # 机器人自动通关，三关都得到终点
+node src/test_logic.js    # physics, collision, pickups, state machine (29 assertions)
+node src/test_levels.js   # level reachability: gap widths and ledge heights
+node src/test_bot.js      # a bot plays all three levels and must reach each exit
 ```
 
-第三个最有意思——它让一个简单 AI 真的去玩，能跑到终点才算出货。
+The third one is the most useful: a simple AI actually plays the game, and the build is only considered valid if it can finish every level.
 
-## 开发笔记
+## Development Notes
 
-做这个游戏踩了两个挺典型的坑，记一下：
+Two mistakes made during development are worth recording.
 
-**一、关卡不能凭感觉画。**
+**Levels cannot be designed by eye.**
 
-第一版的坑画了 14 格宽，玩家根本跳不过去——游戏通不了关。算一下才知道：跳跃初速 11.4、重力 0.62，跳高只有 104 像素（3.28 格），跳远 169 像素（5.29 格）。差距有三四倍。
+The first version used pits fourteen tiles wide. The player cannot clear them, so the game was impossible to finish. Calculating the actual jump arc showed the player rises only 104 pixels (3.28 tiles) and clears 169 pixels horizontally (5.29 tiles) — the gaps were three to four times too large.
 
-后来改成用 Python 脚本生成地图，把「坑宽 ≤ 3 格、台阶高 ≤ 2 格」写成硬约束，生成完自动扫一遍，超限就报错。
+The fix was to generate maps from a script with reachability encoded as a hard constraint: gaps no wider than three tiles, ledges no taller than two tiles. The generator rejects any map that violates these limits.
 
-**二、魔法数字写错不会报错，但会让整个游戏失效。**
+**An incorrect magic number fails silently.**
 
-解析地图时写的是 `row.push(TILE)`（存 32），判断实心时写的却是 `t === 1`。32 永远不等于 1，于是所有地面都不是实心的——玩家一路往下掉，敌人全掉出地图，程序一点错都不报。
+The map parser stored `row.push(TILE)` (the value 32) for solid tiles, while the collision test compared against `=== 1`. Since 32 never equals 1, no tile was ever solid: the player fell through the floor and every enemy dropped out of the world, with no error reported anywhere.
 
-更难发现的是：测试里「落地后不下沉」这一项居然通过了，因为玩家根本没动，位置当然不变。假绿灯比红灯危险得多。
+The failure was especially hard to notice because the test asserting "the player does not sink after landing" passed — the player never moved, so the position never changed. A false green is more dangerous than a red.
 
 ## License
 
-[MIT](LICENSE) —— 随便用，随便改。
+[MIT](LICENSE) — free to use, modify, and distribute.
 
-## 关于
+## Acknowledgements
 
-这个游戏是跟 AI 助手「小深」一起做的。关卡设计、物理参数、渲染代码都是边写边测出来的，上面的开发笔记也是真实踩坑记录。
-
-玩得开心。
+Built in collaboration with an AI assistant. The level design, physics tuning, and rendering code were written and tested iteratively; the development notes above are a record of real mistakes made along the way.
